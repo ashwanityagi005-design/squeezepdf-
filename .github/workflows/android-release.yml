@@ -1,4 +1,4 @@
-I name: Build & Sign SqueezePDF Release
+name: Build & Sign SqueezePDF Release
 
 on:
   push:
@@ -30,7 +30,7 @@ jobs:
       - name: Install Image Processing Utilities
         run: sudo apt-get update && sudo apt-get install -y librsvg2-bin imagemagick
 
-      # 1. नीला-पीला लोगो बनाना
+      # 1. नीला-पीला HD लोगो जनरेट करना
       - name: Generate Blue-Yellow Document Logo
         run: |
           cat << 'EOF' > app_icon.svg
@@ -46,14 +46,14 @@ jobs:
           EOF
           rsvg-convert -w 1024 -h 1024 app_icon.svg -o icon_1024.png
 
-      # 2. असली इंजन बिल्ड करना
+      # 2. पूरा वेब इंजन और डिपेंडेंसी तैयार करना
       - name: Install Dependencies & Build Web Assets
         run: |
           npm ci || npm install
           npm run build
           npx cap sync android
 
-      # 3. लोगो सेट करना
+      # 3. नया लोगो ऐप पर लगाना
       - name: Apply App Icons
         run: |
           for dir in android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi; do
@@ -65,40 +65,6 @@ jobs:
           done
           rm -f android/app/src/main/res/mipmap-anydpi-v26/*.png
 
-      # 4. चाबी (Keystore) लोड करना
-      - name: Restore Keystore
-        env:
-          KEYSTORE_CONTENT: ${{ secrets.ANDROID_SIGNING_KEY || secrets.KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-          if [ -z "$KEYSTORE_CONTENT" ]; then
-            echo "Keystore secret is missing!"
-            exit 1
-          fi
-          printf '%s' "$KEYSTORE_CONTENT" | base64 --decode > /tmp/release.keystore
-          test -s /tmp/release.keystore
-
-      # 5. असली Signed APK बनाना
-      - name: Compile and Sign Release APK
-        env:
-          STORE_PASS: ${{ secrets.ANDROID_KEY_STORE_PASSWORD || secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS_VAL: ${{ secrets.ANDROID_KEY_ALIAS || secrets.KEY_ALIAS }}
-          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.KEY_PASSWORD }}
-        run: |
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file=/tmp/release.keystore \
-            -Pandroid.injected.signing.store.password="$STORE_PASS" \
-            -Pandroid.injected.signing.key.alias="$KEY_ALIAS_VAL" \
-            -Pandroid.injected.signing.key.password="$KEY_PASS" \
-            --no-daemon
-          cd ..
-
-      # 6. APK डाउनलोड के लिए देना
-      - name: Upload Signed APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: SqueezePDF-Pro-Release-v${{ github.run_number }}
-          path: android/app/build/outputs/apk/release/*.apk
-          if-no-files-found: error
+      # 4. ऑटोमैटिक की बनाना और APK साइन करना (बिना किसी सीक्रेट या पासवर्ड एरर के)
+      - name: Generate Key and Sign APK
+        run:
