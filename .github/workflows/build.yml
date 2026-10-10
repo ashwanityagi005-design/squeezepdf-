@@ -1,4 +1,4 @@
-name: Build & Sign SqueezePDF Release
+name: Build SqueezePDF APK
 
 on:
   push:
@@ -27,11 +27,10 @@ jobs:
           distribution: zulu
           java-version: '21'
 
-      - name: Install Image Processing Utilities
+      - name: Install Tools
         run: sudo apt-get update && sudo apt-get install -y librsvg2-bin imagemagick
 
-      # 1. Generate Blue-Yellow Branding Assets
-      - name: Generate Blue-Yellow Document Logo
+      - name: Generate Blue-Yellow Logo
         run: |
           cat << 'EOF' > app_icon.svg
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="1024" height="1024">
@@ -46,14 +45,12 @@ jobs:
           EOF
           rsvg-convert -w 1024 -h 1024 app_icon.svg -o icon_1024.png
 
-      # 2. Build PaperKnife Web Core & Capacitor Assets
-      - name: Install Dependencies & Build Web Assets
+      - name: Build Web App
         run: |
           npm ci || npm install
           npm run build
           npx cap sync android
 
-      # 3. Apply Adaptive Icons
       - name: Apply App Icons
         run: |
           for dir in android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi; do
@@ -65,40 +62,23 @@ jobs:
           done
           rm -f android/app/src/main/res/mipmap-anydpi-v26/*.png
 
-      # 4. Extract Keystore File Safely
-      - name: Restore Keystore
-        env:
-          KEYSTORE_CONTENT: ${{ secrets.ANDROID_SIGNING_KEY || secrets.KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-          if [ -z "$KEYSTORE_CONTENT" ]; then
-            echo "Keystore secret is missing!"
-            exit 1
-          fi
-          printf '%s' "$KEYSTORE_CONTENT" | base64 --decode > /tmp/release.keystore
-          test -s /tmp/release.keystore
-
-      # 5. Native Gradle Assembly & Signing
       - name: Compile and Sign Release APK
-        env:
-          STORE_PASS: ${{ secrets.ANDROID_KEY_STORE_PASSWORD || secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS_VAL: ${{ secrets.ANDROID_KEY_ALIAS || secrets.KEY_ALIAS }}
-          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.KEY_PASSWORD }}
         run: |
+          keytool -genkey -v -keystore /tmp/auto.keystore -alias squeezepdf -keyalg RSA -keysize 2048 -validity 10000 -storepass 123456 -keypass 123456 -dname "CN=SqueezePDF, OU=App, O=Org, L=City, S=State, C=IN"
           cd android
           chmod +x gradlew
           ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file=/tmp/release.keystore \
-            -Pandroid.injected.signing.store.password="$STORE_PASS" \
-            -Pandroid.injected.signing.key.alias="$KEY_ALIAS_VAL" \
-            -Pandroid.injected.signing.key.password="$KEY_PASS" \
+            -Pandroid.injected.signing.store.file=/tmp/auto.keystore \
+            -Pandroid.injected.signing.store.password=123456 \
+            -Pandroid.injected.signing.key.alias=squeezepdf \
+            -Pandroid.injected.signing.key.password=123456 \
             --no-daemon
           cd ..
+          mv android/app/build/outputs/apk/release/*.apk ./SqueezePDF-v${{ github.run_number }}.apk
 
-      # 6. Upload Signed Release APK Artifact
-      - name: Upload Signed APK
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SqueezePDF-Pro-Release-v${{ github.run_number }}
-          path: android/app/build/outputs/apk/release/*.apk
+          name: SqueezePDF-Build-${{ github.run_number }}
+          path: SqueezePDF-v${{ github.run_number }}.apk
           if-no-files-found: error
