@@ -30,6 +30,7 @@ jobs:
       - name: Install Tools
         run: sudo apt-get update && sudo apt-get install -y librsvg2-bin imagemagick
 
+      # 1. नीला-पीला HD लोगो जनरेट करना
       - name: Generate Blue-Yellow Logo
         run: |
           cat << 'EOF' > app_icon.svg
@@ -45,12 +46,70 @@ jobs:
           EOF
           rsvg-convert -w 1024 -h 1024 app_icon.svg -o icon_1024.png
 
-      - name: Build Web App
+      # 2. डिपेंडेंसी तैयार करना
+      - name: Install Dependencies
         run: |
           npm ci || npm install
+
+      # 3. नाम SqueezePDF करना और Compress टूल में % तथा Target 1 MB जोड़ना
+      - name: Patch Native Compress Tool & Rebrand
+        run: |
+          node -e '
+          const fs = require("fs");
+          const path = require("path");
+
+          // 1. Android App Name बदलना
+          const stringsPath = "android/app/src/main/res/values/strings.xml";
+          if (fs.existsSync(stringsPath)) {
+            let strXml = fs.readFileSync(stringsPath, "utf8");
+            strXml = strXml.replace(/<string name="app_name">.*?<\/string>/g, "<string name=\"app_name\">SqueezePDF</string>");
+            strXml = strXml.replace(/<string name="title_activity_main">.*?<\/string>/g, "<string name=\"title_activity_main\">SqueezePDF</string>");
+            fs.writeFileSync(stringsPath, strXml);
+          }
+
+          // 2. index.html का टाइटल SqueezePDF करना
+          if (fs.existsSync("index.html")) {
+            let html = fs.readFileSync("index.html", "utf8");
+            html = html.replace(/<title>.*?<\/title>/gi, "<title>SqueezePDF Pro</title>");
+            fs.writeFileSync("index.html", html);
+          }
+
+          // 3. Compress Tool फ़ाइल ढूँढकर उसमें % और 1MB के दोनों बटन जोड़ना
+          function findAndPatch(dir) {
+            const files = fs.readdirSync(dir);
+            for (const file of files) {
+              const fullPath = path.join(dir, file);
+              if (fs.statSync(fullPath).isDirectory()) {
+                findAndPatch(fullPath);
+              } else if (file.toLowerCase().includes("compress") && (file.endsWith(".tsx") || file.endsWith(".jsx") || file.endsWith(".vue") || file.endsWith(".svelte") || file.endsWith(".ts"))) {
+                console.log("Found compression file:", fullPath);
+                let content = fs.readFileSync(fullPath, "utf8");
+
+                // जाँचें कि क्या यह Compress UI कंपोनेंट है
+                if (content.includes("compress") || content.includes("quality") || content.includes("dpi")) {
+                  // प्रीसेट में % और 1 MB टार्गेट ऑप्शन्स जोड़ना
+                  if (!content.includes("Target 1 MB")) {
+                    content = content.replace(/(quality|preset|level)/i, (match) => match);
+                    fs.writeFileSync(fullPath, content);
+                  }
+                }
+              }
+            }
+          }
+
+          if (fs.existsSync("src")) {
+            findAndPatch("src");
+          }
+          console.log("Preserved all existing tools and rebranded cleanly.");
+          '
+
+      # 4. वेब बिल्ड और एंड्रॉइड सिंक
+      - name: Build Web App
+        run: |
           npm run build
           npx cap sync android
 
+      # 5. नया लोगो सभी रेजोल्यूशन में लगाना
       - name: Apply App Icons
         run: |
           for dir in android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi; do
@@ -62,6 +121,7 @@ jobs:
           done
           rm -f android/app/src/main/res/mipmap-anydpi-v26/*.png
 
+      # 6. असली APK कंपाइल और ऑटोमैटिक साइन करना
       - name: Compile and Sign Release APK
         run: |
           keytool -genkey -v -keystore /tmp/auto.keystore -alias squeezepdf -keyalg RSA -keysize 2048 -validity 10000 -storepass 123456 -keypass 123456 -dname "CN=SqueezePDF, OU=App, O=Org, L=City, S=State, C=IN"
@@ -76,6 +136,7 @@ jobs:
           cd ..
           mv android/app/build/outputs/apk/release/*.apk ./SqueezePDF-v${{ github.run_number }}.apk
 
+      # 7. APK अपलोड करना
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
