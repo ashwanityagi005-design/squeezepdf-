@@ -16,10 +16,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Setup Java 21
         uses: actions/setup-java@v4
@@ -83,7 +83,7 @@ jobs:
           npx cap add android || true
           npx cap sync android
 
-      # 5. नया नीला-पीला लोगो लागू करना (Foreground + Round)
+      # 5. नया नीला-पीला लोगो लागू करना
       - name: Apply New Icons
         run: |
           for dir in android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi; do
@@ -93,35 +93,3 @@ jobs:
               convert icon_1024.png -resize 96x96 "$dir/ic_launcher_foreground.png" || true
             fi
           done
-          rm -f android/app/src/main/res/mipmap-anydpi-v26/*.png
-
-      # 6. Keystore रीस्टोर
-      - name: Restore Keystore
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-          test -n "$KEYSTORE_BASE64"
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > /tmp/release.keystore
-          test -s /tmp/release.keystore
-
-      # 7. असली Signed APK तैयार करना
-      - name: Build Signed APK
-        run: |
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file=/tmp/release.keystore \
-            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
-            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
-            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}" \
-            --no-daemon
-          cd ..
-
-      # 8. APK अपलोड करना
-      - name: Upload Full Real APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: SqueezePDF-Full-Pro-v${{ github.run_number }}
-          path: android/app/build/outputs/apk/release/app-release.apk
-          if-no-files-found: error
