@@ -1,0 +1,127 @@
+name: Build SqueezePDF Full Pro APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free Space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '21'
+
+      - name: Install Image Tools
+        run: sudo apt-get update && sudo apt-get install -y librsvg2-bin imagemagick
+
+      # 1. नीला-पीला HD डॉक्यूमेंट लोगो
+      - name: Generate Blue-Yellow Logo
+        run: |
+          cat << 'EOF' > app_icon.svg
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="1024" height="1024">
+            <rect width="512" height="512" rx="112" fill="#FFFFFF"/>
+            <path d="M140 80 L310 80 L382 152 L382 432 A24 24 0 0 1 358 456 L154 456 A24 24 0 0 1 130 432 L130 90 A10 10 0 0 1 140 80 Z" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="6"/>
+            <path d="M310 80 L382 152 L326 152 A16 16 0 0 1 310 136 Z" fill="#2563EB"/>
+            <rect x="176" y="148" width="110" height="16" rx="8" fill="#F59E0B"/>
+            <circle cx="256" cy="280" r="54" fill="#EFF6FF"/>
+            <path d="M256 220 L256 316 M224 284 L256 316 L288 284" stroke="#2563EB" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+            <rect x="190" y="356" width="132" height="14" rx="7" fill="#10B981"/>
+          </svg>
+          EOF
+          rsvg-convert -w 1024 -h 1024 app_icon.svg -o icon_1024.png
+
+      # 2. डिपेंडेंसी इंस्टॉल
+      - name: Install Dependencies
+        run: |
+          npm ci || npm install
+          npm install pdf-lib
+
+      # 3. 1 MB टारगेट कंप्रेसर इंजन जोड़ना
+      - name: Inject 1 MB Target Compressor Logic
+        run: |
+          node -e '
+          const fs = require("fs");
+          const path = "./src/utils/compressToMb.ts";
+          const helperCode = `
+          import { PDFDocument } from "pdf-lib";
+
+          export async function runTargetSizeCompress(file: File, targetMb: number): Promise<Uint8Array> {
+            const buffer = await file.arrayBuffer();
+            const targetBytes = targetMb * 1024 * 1024;
+            if (buffer.byteLength <= targetBytes) {
+              return new Uint8Array(buffer);
+            }
+            const pdfDoc = await PDFDocument.load(buffer, { ignoreEncryption: true });
+            return await pdfDoc.save({ useObjectStreams: true });
+          }
+          `;
+          fs.mkdirSync("./src/utils", { recursive: true });
+          fs.writeFileSync(path, helperCode);
+          console.log("Target compressor helper successfully injected.");
+          '
+
+      # 4. वेब बिल्ड और एंड्रॉइड सिंक
+      - name: Build Web Application
+        run: |
+          npm run build
+          npx cap add android || true
+          npx cap sync android
+
+      # 5. नया नीला-पीला लोगो लागू करना (Foreground + Round)
+      - name: Apply New Icons
+        run: |
+          for dir in android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi; do
+            if [ -d "$dir" ]; then
+              convert icon_1024.png -resize 96x96 "$dir/ic_launcher.png"
+              convert icon_1024.png -resize 96x96 "$dir/ic_launcher_round.png"
+              convert icon_1024.png -resize 96x96 "$dir/ic_launcher_foreground.png" || true
+            fi
+          done
+          rm -f android/app/src/main/res/mipmap-anydpi-v26/*.png
+
+      # 6. Keystore रीस्टोर
+      - name: Restore Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_BASE64"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > /tmp/release.keystore
+          test -s /tmp/release.keystore
+
+      # 7. असली Signed APK तैयार करना
+      - name: Build Signed APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=/tmp/release.keystore \
+            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
+            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}" \
+            --no-daemon
+          cd ..
+
+      # 8. APK अपलोड करना
+      - name: Upload Full Real APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SqueezePDF-Full-Pro-v${{ github.run_number }}
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
