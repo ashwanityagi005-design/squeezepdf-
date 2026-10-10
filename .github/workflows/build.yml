@@ -45,27 +45,54 @@ jobs:
           </svg>
           EOF
           rsvg-convert -w 1024 -h 1024 app_icon.svg -o icon_1024.png
+          # पब्लिक फोल्डर और वेब एसेट्स के फेविकॉन/लोगो भी बदलें
+          find . -name "favicon.ico" -exec cp icon_1024.png {} \; 2>/dev/null || true
+          find . -name "favicon.svg" -exec cp app_icon.svg {} \; 2>/dev/null || true
+          find . -name "logo.svg" -exec cp app_icon.svg {} \; 2>/dev/null || true
+          find . -name "logo.png" -exec cp icon_1024.png {} \; 2>/dev/null || true
 
-      # 2. पूरी ऐप के अंदर से PaperKnife का ज़िक्र हटाना और SqueezePDF करना
-      - name: Complete Rebranding to SqueezePDF
+      # 2. पूरी ऐप के अंदर से PaperKnife का ज़िक्र और सपोर्ट लिंक्स बदलना
+      - name: Complete Rebranding & Support Link Fix
         run: |
           node -e '
           const fs = require("fs");
           const path = require("path");
 
-          // फ़ाइलों को स्कैन करके टेक्स्ट बदलने वाला फ़ंक्शन
+          const REPO_URL = "https://github.com/ashwanityagi005-design/squeezepdf-";
+
           function replaceInFile(filePath) {
             try {
               let text = fs.readFileSync(filePath, "utf8");
               let changed = false;
+
+              // 1. नाम बदलना
               if (text.includes("PaperKnife") || text.includes("Paper Knife") || text.includes("paperknife")) {
                 text = text.replace(/PaperKnife/g, "SqueezePDF");
                 text = text.replace(/Paper Knife/g, "SqueezePDF");
+                text = text.replace(/paperknife\.app/g, "squeezepdf.app");
                 text = text.replace(/paperknife/g, "squeezepdf");
-                fs.writeFileSync(filePath, text, "utf8");
                 changed = true;
               }
-              if (changed) console.log("Rebranded:", filePath);
+
+              // 2. बाहरी सपोर्ट, गिटहब और डोनेशन लिंक्स बदलना
+              if (text.includes("github.com/") && (text.includes("paperknife") || text.includes("squeezepdf"))) {
+                text = text.replace(/https:\/\/github\.com\/[a-zA-Z0-9_\-\.\/]+/g, (match) => {
+                  if (match.includes("ashwanityagi005-design")) return match;
+                  return REPO_URL;
+                });
+                changed = true;
+              }
+
+              // 3. बाय मी अ कॉफ़ी या अन्य सपोर्ट पेजों को न्यूट्रल करना
+              if (text.includes("buymeacoffee.com") || text.includes("ko-fi.com")) {
+                text = text.replace(/https:\/\/(www\.)?(buymeacoffee|ko-fi)\.com\/[a-zA-Z0-9_\-\.\/]+/g, "#");
+                changed = true;
+              }
+
+              if (changed) {
+                fs.writeFileSync(filePath, text, "utf8");
+                console.log("Updated Support & Branding in:", filePath);
+              }
             } catch (e) {}
           }
 
@@ -82,7 +109,6 @@ jobs:
             });
           }
 
-          // src, android और index.html को साफ़ करें
           if (fs.existsSync("src")) walkDir("src");
           if (fs.existsSync("index.html")) replaceInFile("index.html");
           if (fs.existsSync("capacitor.config.ts")) replaceInFile("capacitor.config.ts");
@@ -97,7 +123,7 @@ jobs:
           npm run build
           npx cap sync android
 
-      # 4. नया लोगो लगाना
+      # 4. ऐप और एंड्रॉइड मिपमैप लोगो रिप्लेस करना
       - name: Apply App Icons
         run: |
           for dir in android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi; do
@@ -109,10 +135,9 @@ jobs:
           done
           rm -f android/app/src/main/res/mipmap-anydpi-v26/*.png
 
-      # 5. स्थायी की (Fixed Keystore) से साइन करना (ताकि इन-प्लेस अपडेट काम करे)
+      # 5. स्थायी की (Fixed Keystore) से साइन करना
       - name: Compile and Sign Release APK with Permanent Seed
         run: |
-          # एक स्थायी और फिक्स की-स्टोर बनाएँ ताकि हर बिल्ड का सिग्नेचर एक जैसा रहे
           keytool -genkeypair -v \
             -keystore /tmp/squeezer_permanent.keystore \
             -alias squeezepdf_master \
