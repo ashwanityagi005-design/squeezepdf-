@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import { Zap, Loader2, X, FileIcon, ChevronLeft, ChevronRight, Maximize2, ArrowRight, Lock } from 'lucide-react'
+import { Zap, Loader2, X, FileIcon, ChevronLeft, ChevronRight, Maximize2, ArrowRight, Lock, Target, Percent, Sliders } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { getPdfMetaData, loadPdfDocument, renderPageThumbnail, unlockPdf } from '../../utils/pdfHelpers'
@@ -90,7 +90,12 @@ export default function CompressTool() {
   const [isProcessing, setIsProcessing] = useState(false)
   const [unlockingIds, setUnlockingIds] = useState<Set<string>>(new Set())
   const [globalProgress, setGlobalProgress] = useState(0)
+
+  // 3 Mode selection: 'preset' (Original 3 tiers), 'percent', 'target'
+  const [controlMode, setControlMode] = useState<'preset' | 'percent' | 'target'>('preset')
   const [quality, setQuality] = useState<CompressionQuality>('medium')
+  const [percentTarget, setPercentTarget] = useState<30 | 50 | 70>(50)
+  const [targetMb, setTargetMb] = useState<number>(1.0)
   const [showSuccess, setShowSuccess] = useState(false)
 
   useEffect(() => {
@@ -116,7 +121,6 @@ export default function CompressTool() {
     }
     setFiles([entry]); setShowSuccess(false); clearUrls()
 
-    // Clear input value to allow selecting the same file again
     if (fileInputRef.current) fileInputRef.current.value = ''
 
     getPdfMetaData(file).then(meta => {
@@ -156,63 +160,118 @@ export default function CompressTool() {
       return
     }
     setFiles(prev => prev.map(f => f.id === item.id ? { ...f, status: 'processing' } : f))
+
     try {
       const originalSize = item.file.size
-      const tierLabel = { high: 'High', medium: 'Standard', low: 'Smallest' } as const
       let res: { url: string, size: number, buffer: Uint8Array }
-      let usedTier: CompressionQuality = quality
-      let crisp = false
-      if (quality === 'low') {
-        // Smallest path untouched, salvage pass included
-        res = await compressSingleFile(item, quality, createUrl, setGlobalProgress)
-        if (res.size >= originalSize) {
-          const retry = await compressSingleFile(item, 'medium', createUrl, setGlobalProgress)
-          if (retry.size < res.size) res = retry
-        }
-      } else {
-        // Condense first (photos shrink, text stays sharp), raster fallback.
-        // A compress tool must never hand back a bigger file without trying lower tiers.
-        const condenseTiers: { maxDim: number, jpegQ: number, tier: CompressionQuality }[] = quality === 'high'
-          ? [{ maxDim: 2560, jpegQ: 0.8, tier: 'high' }, { maxDim: 1920, jpegQ: 0.65, tier: 'medium' }]
-          : [{ maxDim: 1920, jpegQ: 0.65, tier: 'medium' }]
-        const rasterTiers: CompressionQuality[] = quality === 'high' ? ['high', 'medium', 'low'] : ['medium', 'low']
-        const state: { best: { res: { url: string, size: number, buffer: Uint8Array }, usedTier: CompressionQuality, crisp: boolean } | null } = { best: null }
-        const consider = (attempt: { url: string, size: number, buffer: Uint8Array }, tier: CompressionQuality, isCrisp: boolean) => {
-          if (!state.best || attempt.size < state.best.res.size) state.best = { res: attempt, usedTier: tier, crisp: isCrisp }
-          return attempt.size < originalSize
-        }
-        for (const c of condenseTiers) {
+      let outcomeMessage = ''
+
+      if (controlMode === 'target') {
+        // Target Size Mode (<= Target MB)
+        const targetBytes = targetMb * 1024 * 1024
+        const attempts: { tier: CompressionQuality, condense: boolean }[] = [
+          { tier: 'high', condense: true },
+          { tier: 'medium', condense: true },
+          { tier: 'medium', condense: false },
+          { tier: 'low', condense: false }
+        ]
+        let best: { url: string, size: number, buffer: Uint8Array } | null = null
+        for (const plan of attempts) {
           try {
-            const attempt = await condenseImages(item, c.maxDim, c.jpegQ, createUrl, setGlobalProgress)
-            if (consider(attempt, c.tier, true)) break
-          } catch { /* photos unshrinkable — fall through to raster */ }
-        }
-        if (!state.best || state.best.res.size >= originalSize) {
-          for (const tier of rasterTiers) {
             let attempt
-            try {
-              attempt = await compressSingleFile(item, tier, createUrl, setGlobalProgress)
-            } catch (e) {
-              if (tier === 'high') continue // raster failure at top tier — fall through to lower tiers
-              throw e
+            if (plan.condense) {
+              const maxDim = plan.tier === 'high' ? 2560 : 1920
+              const qVal = plan.tier === 'high' ? 0.8 : 0.65
+              attempt = await condenseImages(item, maxDim, qVal, createUrl, setGlobalProgress)
+            } else {
+              attempt = await compressSingleFile(item, plan.tier, createUrl, setGlobalProgress)
             }
-            if (attempt && consider(attempt, tier, false)) break
-          }
+            if (!best || attempt.size < best.size) best = attempt
+            if (attempt.size <= targetBytes) {
+              best = attempt
+              break
+            }
+          } catch { }
         }
-        if (!state.best) throw new Error(`Failed to compress "${item.file.name}".`)
-        res = state.best.res; usedTier = state.best.usedTier; crisp = state.best.crisp
+        if (!best) throw new Error(`Could not fit "${item.file.name}" into ${targetMb} MB.`)
+        res = best
+        const mb = (res.size / (1024 * 1024)).toFixed(2)
+        outcomeMessage = res.size <= targetBytes ? `Target Hit: ${mb} MB (≤ ${targetMb} MB)` : `Closest fit: ${mb} MB`
+
+      } else if (controlMode === 'percent') {
+        // Percentage Mode
+        const selectedTier: CompressionQuality = percentTarget === 30 ? 'high' : percentTarget === 50 ? 'medium' : 'low'
+        const doCondense = percentTarget !== 70
+        let bestAttempt: { url: string, size: number, buffer: Uint8Array } | null = null
+        if (doCondense) {
+          try {
+            const maxDim = selectedTier === 'high' ? 2560 : 1920
+            const qVal = selectedTier === 'high' ? 0.8 : 0.65
+            bestAttempt = await condenseImages(item, maxDim, qVal, createUrl, setGlobalProgress)
+          } catch { }
+        }
+        if (!bestAttempt || bestAttempt.size >= originalSize) {
+          bestAttempt = await compressSingleFile(item, selectedTier, createUrl, setGlobalProgress)
+        }
+        res = bestAttempt
+        const pct = ((1 - res.size / originalSize) * 100).toFixed(0)
+        outcomeMessage = `Reduced by ${pct}% (${percentTarget}% target)`
+
+      } else {
+        // Original 3 Presets Engine (High, Standard, Smallest)
+        const tierLabel = { high: 'High', medium: 'Standard', low: 'Smallest' } as const
+        let usedTier: CompressionQuality = quality
+        let crisp = false
+
+        if (quality === 'low') {
+          res = await compressSingleFile(item, quality, createUrl, setGlobalProgress)
+          if (res.size >= originalSize) {
+            const retry = await compressSingleFile(item, 'medium', createUrl, setGlobalProgress)
+            if (retry.size < res.size) res = retry
+          }
+        } else {
+          const condenseTiers: { maxDim: number, jpegQ: number, tier: CompressionQuality }[] = quality === 'high'
+            ? [{ maxDim: 2560, jpegQ: 0.8, tier: 'high' }, { maxDim: 1920, jpegQ: 0.65, tier: 'medium' }]
+            : [{ maxDim: 1920, jpegQ: 0.65, tier: 'medium' }]
+          const rasterTiers: CompressionQuality[] = quality === 'high' ? ['high', 'medium', 'low'] : ['medium', 'low']
+          const state: { best: { res: { url: string, size: number, buffer: Uint8Array }, usedTier: CompressionQuality, crisp: boolean } | null } = { best: null }
+          const consider = (attempt: { url: string, size: number, buffer: Uint8Array }, tier: CompressionQuality, isCrisp: boolean) => {
+            if (!state.best || attempt.size < state.best.res.size) state.best = { res: attempt, usedTier: tier, crisp: isCrisp }
+            return attempt.size < originalSize
+          }
+          for (const c of condenseTiers) {
+            try {
+              const attempt = await condenseImages(item, c.maxDim, c.jpegQ, createUrl, setGlobalProgress)
+              if (consider(attempt, c.tier, true)) break
+            } catch { }
+          }
+          if (!state.best || state.best.res.size >= originalSize) {
+            for (const tier of rasterTiers) {
+              let attempt
+              try {
+                attempt = await compressSingleFile(item, tier, createUrl, setGlobalProgress)
+              } catch (e) {
+                if (tier === 'high') continue
+                throw e
+              }
+              if (attempt && consider(attempt, tier, false)) break
+            }
+          }
+          if (!state.best) throw new Error(`Failed to compress "${item.file.name}".`)
+          res = state.best.res; usedTier = state.best.usedTier; crisp = state.best.crisp
+        }
+
+        const steppedDown = usedTier !== quality
+        const pct = ((1 - res.size / originalSize) * 100).toFixed(0)
+        const baseOutcome = steppedDown ? `Reduced by ${pct}% (used ${tierLabel[usedTier]})` : `Reduced by ${pct}%`
+        outcomeMessage = crisp ? `${baseOutcome} — text stays sharp` : baseOutcome
       }
-      // Never ship an unusable result
+
       if (res.size < 1024) throw new Error(`"${item.file.name}" compressed to an unusable file.`)
-      // Guarantee: never hand back a bigger file than the original —
-      // except locked inputs, which must ship the rebuilt (unlocked) result
       const wasLocked = !!item.password
-      const steppedDown = usedTier !== quality
-      const pct = ((1 - res.size / originalSize) * 100).toFixed(0)
-      const baseOutcome = steppedDown ? `Reduced by ${pct}% (used ${tierLabel[usedTier]})` : `Reduced by ${pct}%`
-      const outcome = crisp ? `${baseOutcome} — text stays sharp` : baseOutcome
       let finalBuffer = res.buffer, finalSize = res.size, finalUrl = res.url, keptOriginal = false, unlockedGrew = false
-      let finalMessage = outcome
+      let finalMessage = outcomeMessage
+
       if (res.size >= originalSize && !wasLocked) {
         finalBuffer = new Uint8Array(await item.file.arrayBuffer())
         finalSize = originalSize
@@ -223,9 +282,11 @@ export default function CompressTool() {
         unlockedGrew = true
         finalMessage = 'Unlocked — larger than original'
       }
+
       const outName = item.file.name.replace('.pdf', '-compressed.pdf')
       setFiles(prev => prev.map(f => f.id === item.id ? { ...f, status: 'completed', resultUrl: finalUrl, resultSize: finalSize, keptOriginal, unlockedGrew, resultMessage: finalMessage } : f))
       addActivity({ name: outName, tool: 'Compress', size: finalSize, resultUrl: finalUrl, buffer: finalBuffer })
+
       const originalBuffer = await item.file.arrayBuffer()
       setPipelineFile({
         buffer: finalBuffer,
@@ -233,7 +294,8 @@ export default function CompressTool() {
         type: 'application/pdf',
         originalBuffer: new Uint8Array(originalBuffer)
       })
-      if (keptOriginal || unlockedGrew || steppedDown || crisp) toast.success(finalMessage)
+
+      toast.success(finalMessage)
     } catch (e: any) {
       setFiles(prev => prev.map(f => f.id === item.id ? { ...f, status: 'error' } : f))
       toast.error(e?.message || `Failed to compress "${item.file.name}".`)
@@ -245,9 +307,19 @@ export default function CompressTool() {
     <button 
       onClick={startBatchCompression}
       disabled={isProcessing || files.filter(f => !f.isLocked).length === 0}
-      className={`w-full bg-rose-500 hover:bg-rose-600 text-white font-black uppercase tracking-widest transition-all active:scale-95 disabled:opacity-50 flex items-center justify-center gap-3 shadow-lg shadow-rose-500/20 py-4 rounded-2xl text-sm md:p-6 md:rounded-3xl md:text-xl`}
+      className={`w-full bg-blue-600 hover:bg-blue-700 text-white font-black uppercase tracking-widest transition-all active:scale-95 disabled:opacity-50 flex items-center justify-center gap-3 shadow-lg shadow-blue-500/20 py-4 rounded-2xl text-sm md:p-6 md:rounded-3xl md:text-xl`}
     >
-      {isProcessing ? <><Loader2 className="animate-spin" /> {globalProgress}%</> : <>Compress PDF <ArrowRight size={18} /></>}
+      {isProcessing ? (
+        <><Loader2 className="animate-spin" /> {globalProgress}%</>
+      ) : (
+        <>
+          {controlMode === 'target' 
+            ? `Fit Under ${targetMb} MB` 
+            : controlMode === 'percent' 
+            ? `Compress ${percentTarget}%` 
+            : 'Compress PDF'} <ArrowRight size={18} />
+        </>
+      )}
     </button>
   )
 
@@ -258,11 +330,11 @@ export default function CompressTool() {
       {files.length === 0 ? (
         <button 
           onClick={() => !isProcessing && fileInputRef.current?.click()} 
-          className="w-full border-4 border-dashed border-gray-100 dark:border-zinc-900 rounded-[2.5rem] p-12 text-center hover:bg-rose-50 dark:hover:bg-rose-900/10 transition-all cursor-pointer group"
+          className="w-full border-4 border-dashed border-gray-100 dark:border-zinc-900 rounded-[2.5rem] p-12 text-center hover:bg-blue-50 dark:hover:bg-blue-900/10 transition-all cursor-pointer group"
         >
-          <div className="w-20 h-20 bg-rose-50 dark:bg-rose-900/20 text-rose-500 rounded-full flex items-center justify-center mx-auto mb-6 group-hover:scale-110 transition-transform shadow-inner"><Zap size={32} /></div>
-              <h3 className="text-xl font-bold dark:text-white mb-2">Select PDF</h3>
-              <p className="text-sm text-gray-400 font-medium">Tap to start compression</p>
+          <div className="w-20 h-20 bg-blue-50 dark:bg-blue-900/20 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-6 group-hover:scale-110 transition-transform shadow-inner"><Zap size={32} /></div>
+          <h3 className="text-xl font-bold dark:text-white mb-2">Select PDF</h3>
+          <p className="text-sm text-gray-400 font-medium">Tap to start compression</p>
         </button>
       ) : !showSuccess ? (
         <div className="space-y-6 animate-in fade-in duration-500">
@@ -284,7 +356,7 @@ export default function CompressTool() {
                        {unlockingIds.has(f.id) ? (
                          <p className="flex-1 text-[10px] font-bold text-gray-400 flex items-center gap-1.5"><Loader2 size={12} className="animate-spin text-rose-500" /> Unlocking…</p>
                        ) : (
-                         <input type="password" placeholder="Password" className="flex-1 bg-gray-50 dark:bg-black text-[10px] p-1.5 rounded-lg outline-none w-full border border-gray-100 dark:border-zinc-800 focus:border-rose-500" onKeyDown={(e) => { if(e.key === 'Enter') handleUnlock(f.id, e.currentTarget.value) }} />
+                         <input type="password" placeholder="Password" className="flex-1 bg-gray-50 dark:bg-black text-[10px] p-1.5 rounded-lg outline-none w-full border border-gray-100 dark:border-zinc-800 focus:border-blue-600" onKeyDown={(e) => { if(e.key === 'Enter') handleUnlock(f.id, e.currentTarget.value) }} />
                        )}
                     </div>
                   ) : <p className="text-[10px] text-gray-400 font-bold uppercase tracking-tighter">{(f.file.size / (1024*1024)).toFixed(2)} MB • {f.pageCount} Pages</p>}
@@ -294,65 +366,126 @@ export default function CompressTool() {
             ))}
           </div>
 
-          <div className="bg-white dark:bg-zinc-900 p-8 rounded-[2rem] border border-gray-100 dark:border-white/5 shadow-sm">
-            <h4 className="text-[10px] font-black uppercase text-gray-400 mb-6 tracking-widest px-1">Compression Strategy</h4>
-            {files.some(f => f.password) && (
-              <p className="text-amber-700 dark:text-amber-400 font-bold text-[11px] leading-relaxed mb-4 text-center">File output will be unlocked.</p>
-            )}
-            <div className="grid grid-cols-3 gap-3">
-              {[
-                { id: 'high', label: 'High Quality', desc: 'Best Quality' },
-                { id: 'medium', label: 'Standard', desc: 'Balanced' },
-                { id: 'low', label: 'Smallest', desc: 'Max Save' }
-              ].map((lvl) => (
-                <button key={lvl.id} onClick={() => setQuality(lvl.id as CompressionQuality)} className={`p-4 rounded-2xl border-2 transition-all flex flex-col items-center gap-1 ${quality === lvl.id ? 'border-rose-500 bg-rose-50/50 dark:bg-rose-900/10' : 'border-gray-100 dark:border-white/5'}`}>
-                  <span className={`font-black uppercase text-[9px] text-center leading-tight ${quality === lvl.id ? 'text-rose-500' : 'text-gray-400'}`}>{lvl.label}</span>
-                  <span className="text-[8px] text-gray-400 font-bold uppercase">{lvl.desc}</span>
-                </button>
-              ))}
-            </div>
+          <div className="bg-white dark:bg-zinc-900 p-6 md:p-8 rounded-[2rem] border border-gray-100 dark:border-white/5 shadow-sm space-y-6">
             
-            <div className="mt-6 p-6 bg-gray-50 dark:bg-black rounded-2xl border border-gray-100 dark:border-white/5">
-               <div className="flex items-center gap-3 mb-3">
-                 <div className="w-8 h-8 rounded-full bg-rose-500/10 text-rose-500 flex items-center justify-center">
-                   <Zap size={16} />
-                 </div>
-                 <h5 className="text-xs font-black uppercase tracking-widest dark:text-white">Strategy Details</h5>
-               </div>
-               <p className="text-xs text-gray-500 dark:text-zinc-400 leading-relaxed">
-                  {quality === 'high' && (
-                    <>
-                       <strong>High Quality:</strong> Shrinks embedded photos first — text stays sharp and selectable.
-                       Falls back to a full-detail rebuild only when photos can't shrink.
-                       Expected reduction: <span className="text-rose-500 font-bold">varies by file (photo-heavy shrinks most)</span>.
-                    </>
-                  )}
-                 {quality === 'medium' && (
-                   <>
-                       <strong>Standard:</strong> Balanced photo shrink for everyday sharing and email attachments, text stays sharp.
-                       Falls back to a rebuild when photos can't shrink; the original is kept if nothing would shrink.
-                       Expected reduction: <span className="text-rose-500 font-bold">10-60%</span>.
-                   </>
-                 )}
-                  {quality === 'low' && (
-                    <>
-                      <strong>Smallest Size:</strong> Aggressive downsampling for the lowest possible file size. 
-                      Ideal for quick mobile viewing or meeting strict upload limits. 
-                      Expected reduction: <span className="text-rose-500 font-bold">70-90%</span>.
-                    </>
-                  )}
-                </p>
-                <p className="text-[10px] text-gray-400 dark:text-zinc-500 leading-relaxed mt-3">
-                   Note: High and Standard shrink embedded photos first so text stays sharp and selectable, and fall back to rebuilding pages as images when photos can't shrink (text not selectable then). Smallest always rebuilds. If the chosen tier would grow the file, the next option is tried automatically — the original is kept only if nothing shrinks (locked inputs always ship the smallest unlocked rebuild).
-                </p>
-             </div>
+            {/* 3 Main Mode Selection Tabs */}
+            <div className="grid grid-cols-3 gap-2">
+              <button 
+                type="button" 
+                onClick={() => setControlMode('preset')} 
+                className={`p-3 rounded-2xl border-2 transition-all flex flex-col items-center justify-center gap-1 font-black text-[10px] md:text-xs uppercase tracking-wider ${controlMode === 'preset' ? 'border-blue-600 bg-blue-50 dark:bg-blue-950/20 text-blue-600' : 'border-gray-100 dark:border-white/5 text-gray-400'}`}
+              >
+                <Sliders size={14} /> Presets
+              </button>
+              <button 
+                type="button" 
+                onClick={() => setControlMode('percent')} 
+                className={`p-3 rounded-2xl border-2 transition-all flex flex-col items-center justify-center gap-1 font-black text-[10px] md:text-xs uppercase tracking-wider ${controlMode === 'percent' ? 'border-blue-600 bg-blue-50 dark:bg-blue-950/20 text-blue-600' : 'border-gray-100 dark:border-white/5 text-gray-400'}`}
+              >
+                <Percent size={14} /> Percentage (%)
+              </button>
+              <button 
+                type="button" 
+                onClick={() => setControlMode('target')} 
+                className={`p-3 rounded-2xl border-2 transition-all flex flex-col items-center justify-center gap-1 font-black text-[10px] md:text-xs uppercase tracking-wider ${controlMode === 'target' ? 'border-amber-500 bg-amber-50 dark:bg-amber-950/20 text-amber-500' : 'border-gray-100 dark:border-white/5 text-gray-400'}`}
+              >
+                <Target size={14} /> Target (≤ 1 MB)
+              </button>
+            </div>
+
+            {/* TAB 1: ORIGINAL 3 PRESETS (High Quality, Standard, Smallest) */}
+            {controlMode === 'preset' && (
+              <div className="space-y-4">
+                <h4 className="text-[10px] font-black uppercase text-gray-400 tracking-widest px-1">Original Quality Presets</h4>
+                <div className="grid grid-cols-3 gap-3">
+                  {[
+                    { id: 'high', label: 'High Quality', desc: 'Best Quality' },
+                    { id: 'medium', label: 'Standard', desc: 'Balanced' },
+                    { id: 'low', label: 'Smallest', desc: 'Max Save' }
+                  ].map((lvl) => (
+                    <button key={lvl.id} onClick={() => setQuality(lvl.id as CompressionQuality)} className={`p-4 rounded-2xl border-2 transition-all flex flex-col items-center gap-1 ${quality === lvl.id ? 'border-blue-600 bg-blue-50/50 dark:bg-blue-900/10' : 'border-gray-100 dark:border-white/5'}`}>
+                      <span className={`font-black uppercase text-[9px] text-center leading-tight ${quality === lvl.id ? 'text-blue-600' : 'text-gray-400'}`}>{lvl.label}</span>
+                      <span className="text-[8px] text-gray-400 font-bold uppercase">{lvl.desc}</span>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="p-5 bg-gray-50 dark:bg-black rounded-2xl border border-gray-100 dark:border-white/5">
+                   <div className="flex items-center gap-2 mb-2">
+                     <Zap size={14} className="text-blue-600" />
+                     <h5 className="text-[11px] font-black uppercase tracking-widest dark:text-white">Preset Details</h5>
+                   </div>
+                   <p className="text-xs text-gray-500 dark:text-zinc-400 leading-relaxed">
+                      {quality === 'high' && <><strong>High Quality:</strong> Shrinks photos first — text stays crisp and selectable. Best for documents with images.</>}
+                      {quality === 'medium' && <><strong>Standard:</strong> Balanced photo shrink for email attachments and sharing (10-60% reduction).</>}
+                      {quality === 'low' && <><strong>Smallest Size:</strong> Aggressive downsampling for strict upload limits (70-90% reduction).</>}
+                   </p>
+                </div>
+              </div>
+            )}
+
+            {/* TAB 2: PERCENTAGE MODE */}
+            {controlMode === 'percent' && (
+              <div className="space-y-4">
+                <h4 className="text-[10px] font-black uppercase text-gray-400 tracking-widest px-1">Select Percentage Target</h4>
+                <div className="grid grid-cols-3 gap-3">
+                  {[
+                    { val: 30, label: '30% Reduction', desc: 'Sharp Text' },
+                    { val: 50, label: '50% Reduction', desc: 'Balanced' },
+                    { val: 70, label: '70% Reduction', desc: 'Smallest' }
+                  ].map((p) => (
+                    <button 
+                      key={p.val} 
+                      type="button"
+                      onClick={() => setPercentTarget(p.val as any)} 
+                      className={`p-4 rounded-2xl border-2 transition-all flex flex-col items-center gap-1 ${percentTarget === p.val ? 'border-blue-600 bg-blue-50/50 dark:bg-blue-900/10' : 'border-gray-100 dark:border-white/5'}`}
+                    >
+                      <span className={`font-black uppercase text-[10px] text-center ${percentTarget === p.val ? 'text-blue-600' : 'text-gray-400'}`}>{p.label}</span>
+                      <span className="text-[8px] text-gray-400 font-bold uppercase">{p.desc}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 3: TARGET MB MODE */}
+            {controlMode === 'target' && (
+              <div className="space-y-4">
+                <h4 className="text-[10px] font-black uppercase text-gray-400 tracking-widest px-1">Set Target Size in Megabytes</h4>
+                <div className="p-4 rounded-2xl border-2 border-gray-100 dark:border-white/5 flex flex-wrap items-center justify-between gap-4">
+                  <div className="flex items-center gap-3">
+                    <input 
+                      type="number" 
+                      step="0.1" 
+                      min="0.1" 
+                      value={targetMb} 
+                      onChange={(e) => setTargetMb(Math.max(0.1, parseFloat(e.target.value) || 1))}
+                      className="w-24 p-2 text-center text-lg font-black rounded-xl border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-black text-gray-900 dark:text-white outline-none focus:border-amber-500" 
+                    />
+                    <span className="text-sm font-bold text-gray-600 dark:text-zinc-300">MB Target</span>
+                  </div>
+                  <div className="flex gap-2">
+                    {[0.5, 1.0, 2.0].map((preset) => (
+                      <button 
+                        key={preset}
+                        type="button"
+                        onClick={() => setTargetMb(preset)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-black uppercase border ${targetMb === preset ? 'bg-amber-500 text-white border-amber-500' : 'border-gray-200 dark:border-zinc-800 text-gray-500'}`}
+                      >
+                        {preset} MB
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
 
             {isProcessing && (
               <div className="mt-8 space-y-3">
                 <div className="w-full bg-gray-100 dark:bg-zinc-800 h-2 rounded-full overflow-hidden shadow-inner">
-                   <div className="bg-rose-500 h-full transition-all" style={{ width: `${globalProgress}%` }} />
+                   <div className="bg-blue-600 h-full transition-all" style={{ width: `${globalProgress}%` }} />
                 </div>
-                <p className="text-[10px] text-center font-black uppercase text-gray-400 tracking-widest animate-pulse">Rasterizing Document...</p>
+                <p className="text-[10px] text-center font-black uppercase text-gray-400 tracking-widest animate-pulse">Squeezing Document Locally...</p>
               </div>
             )}
           </div>
